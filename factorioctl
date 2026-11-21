@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""Factorio headless server manager; Python 3.9+, standard library only."""
+import argparse
+import datetime
+import difflib
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.parse
+import urllib.request
+import zipfile
+
+ROOT = Path(os.environ.get('FACTORIO_HOME', '/home/factorio')).expanduser()
+AGENT = 'factorioctl/1.14.1'
+
+# Configure startup maintenance here. Updates run before the Factorio process starts.
+AUTO_UPDATE_ON_START = True
+AUTO_UPDATE_BRANCH = 'stable'
+AUTO_UPDATE_GAME = True
+AUTO_UPDATE_MODS = True
+# False means a portal/network/update failure prevents startup rather than risking an altered save.
+START_IF_UPDATE_FAILS = False
+# Safety guard: refuse an apparently vanilla mod list on a populated server.
+# Set True only when you deliberately intend a vanilla/Space Age-only server.
+ALLOW_VANILLA_MOD_LIST = False
+UNIT_TEMPLATES = {
+    'factorio@.service': '[Unit]\nDescription=Factorio headless server %i\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=120\nStartLimitBurst=3\n\n[Service]\nType=simple\nWorkingDirectory=/home/factorio/server-%i\nExecStart=/home/factorio/factorioctl run-server %i\nRestart=on-failure\nRestartSec=10\nTimeoutStopSec=120\nKillSignal=SIGINT\n\n[Install]\nWantedBy=default.target\n',
+    'factorio-restart@.service': '[Unit]\nDescription=Controlled scheduled restart of Factorio %i\n\n[Service]\nType=oneshot\nExecCondition=/usr/bin/systemctl --user is-active --quiet factorio@%i.service\nExecStart=/usr/bin/systemctl --user try-restart factorio@%i.service\n',
+    'factorio-restart@.timer': '[Unit]\nDescription=Restart Factorio %i daily at 2am\n\n[Timer]\nOnCalendar=*-*-* 02:00:00\nPersistent=false\nUnit=factorio-restart@%i.service\n\n[Install]\nWantedBy=timers.target\n',
+}
+TIMEOUT = 60
+# True only while systemd's run-server command is doing startup work.
+STARTUP_MAINTENANCE_ACTIVE = False
+MOD_INDEX_TTL_SECONDS = 3600  # Reuse the shared mod-portal index for one hour.
+DEFAULT_RESTART_TIME = '02:00'  # Local server time; bootstrap enables this daily timer.
+
+def fail(message):
+    raise RuntimeError(message)
+
+def run(args, **kw):
+    print('+', ' '.join(map(str,args)), flush=True)
+    return subprocess.run(list(map(str,args)), check=True, **kw)
+
+def get(url, params=None):
+    if params:
+        url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
+    req=urllib.request.Request(url,headers={'User-Agent':AGENT})
+    with urllib.request.urlopen(req,timeout=TIMEOUT) as response:
+        return response.read()
+
+def download(url, dest):
+    req=urllib.request.Request(url,headers={'User-Agent':AGENT})
+    with urllib.request.urlopen(req,timeout=TIMEOUT) as r, open(dest,'wb') as out:
+        shutil.copyfileobj(r,out)
+
+def instance(number):
+    if not re.fullmatch(r'[1-9][0-9]*', str(number)):
+        fail('Instance must be a positive integer')
+    return ROOT / f'server-{number}'
+
+def binary(path): return path/'bin/x64/factorio'
+
+def require_server(number):
+    path = instance(number)
+    if not path.is_dir() or not binary(path).is_file():
+        fail(f'Server {number} not found (or installation incomplete): {path}\n'
+             f'Do you need to run `factorioctl bootstrap {number}`?')
+    return path
+
+def systemd(*args): run(['systemctl','--user',*args])
+
+def load_json(path):
+    return json.loads(path.read_text())
+
+def write_json(path, obj):
+    tmp=path.with_name(path.name+'.tmp')
+    tmp.write_text(json.dumps(obj,indent=2)+'\n')
+    tmp.replace(path)
+
+def install_binary(path, branch):
+    url=f'https://factorio.com/get-download/{branch}/headless/linux64'
+    with tempfile.TemporaryDirectory(prefix='factorioctl-') as work:
+        archive=Path(work)/'factorio.tar.xz'
+        print('Downloading',url,flush=True)
+        download(url,archive)
+        with tarfile.open(archive,'r:xz') as tar:
+            members=tar.getmembers()
+            for member in members:
+                name=Path(member.name)
+                if (not name.parts or name.parts[0]!='factorio' or name.is_absolute() or
+                    '..' in name.parts or not (member.isfile() or member.isdir())):
+                    fail('Unsafe entry in Factorio archive: '+member.name)
+            # Python 3.9/3.10 TarFile.extractall has no filter argument.
+            # Members were explicitly restricted to regular files and directories
+            # within the expected top-level factorio/ directory above.
+            if sys.version_info >= (3, 12):
+                tar.extractall(work, filter='data')
+            else:
+                tar.extractall(work)
+        extracted=Path(work)/'factorio'
+        if not binary(extracted).is_file(): fail('Downloaded archive missing binary')
+        if path.exists(): fail(f'{path} already exists; bootstrap never overwrites')
+        path.parent.mkdir(parents=True,exist_ok=True)
+        shutil.move(str(extracted),str(path))
+
+def sync_units(assume_yes=False):
+    """Check embedded unit templates and request consent for needed changes."""
+    target=Path.home()/'.config/systemd/user'
+    changes=[]
+    for name, content in UNIT_TEMPLATES.items():
+        dst=target/name
+        desired=content.encode('utf-8')
+        current=dst.read_bytes() if dst.is_file() else None
+        if current==desired:
+            continue
+        print(f'\nSystemd unit {name}: '+('not installed' if current is None else 'update available'))
+        if current is not None:
+            print(''.join(difflib.unified_diff(
+                current.decode('utf-8',errors='replace').splitlines(keepends=True),
+                content.splitlines(keepends=True),
+                fromfile=str(dst),tofile='embedded:'+name)),end='')
+        else:
+            print('Install to:',dst)
+            print(content)
+        if not assume_yes:
+            if not sys.stdin.isatty():
+                fail(f'Approval required to install {name}; run interactively or with --yes')
+            answer=input('Install/replace this unit? [y/N] ').strip().lower()
+            if answer not in ('y','yes'):
+                fail(f'Declined {name}; no changes made to this unit')
+        changes.append((dst,desired))
+
+    if changes:
+        target.mkdir(parents=True,exist_ok=True)
+        stamp=datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        for dst,desired in changes:
+            if dst.exists():
+                backup=dst.with_name(dst.name+'.bak-'+stamp)
+                shutil.copy2(dst,backup)
+                print('Backed up:',backup)
+            with tempfile.NamedTemporaryFile(mode='wb',dir=target,prefix=dst.name+'.',delete=False) as fp:
+                tmp=Path(fp.name)
+                fp.write(desired)
+            try:
+                os.replace(tmp,dst)
+            finally:
+                tmp.unlink(missing_ok=True)
+            if dst.read_bytes()!=desired:
+                fail(f'Unit verification failed: {dst}')
+            print('Installed:',dst)
+        systemd('daemon-reload')
+    return bool(changes)
+
+def service_port(number):
+    number=int(number)
+    port=34196+number
+    if port>65535:fail('Instance number too large for a UDP port')
+    return port
+
+def rcon_port(number):
+    port=27014+int(number)
+    if port>65535:fail('Instance number too large for an RCON port')
+    return port
+
+def rcon_secret(path, create=False):
+    secret_file=path/'.rcon-password'
+    if create:
+        try:
+            fd=os.open(secret_file,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd,'w') as out:
+                out.write(secrets.token_urlsafe(36)+'\n')
+    if not secret_file.is_file():
+        fail('RCON is not configured yet. Restart the server with this version of factorioctl first.')
+    if secret_file.stat().st_mode & 0o077:
+        fail(f'RCON secret permissions are too open: {secret_file}; run chmod 600 on it')
+    value=secret_file.read_text().strip()
+    if not value:fail(f'Empty RCON secret: {secret_file}')
+    return value
+
+def rcon_packet(sock, request_id, packet_type, payload):
+    body=payload.encode('utf-8')+b'\0\0'
+    sock.sendall(struct.pack('<iii',len(body)+8,request_id,packet_type)+body)
+
+def rcon_receive(sock):
+    def read_exact(size):
+        chunks=[]
+        while size:
+            data=sock.recv(size)
+            if not data:fail('RCON connection closed unexpectedly')
+            chunks.append(data)
+            size-=len(data)
+        return b''.join(chunks)
+    size=struct.unpack('<i',read_exact(4))[0]
+    if size<10 or size>4*1024*1024:fail('Invalid RCON response length')
+    data=read_exact(size)
+    request_id,packet_type=struct.unpack('<ii',data[:8])
+    if data[-2:]!=b'\0\0':fail('Invalid RCON response terminator')
+    return request_id,packet_type,data[8:-2].decode('utf-8',errors='replace')
+
+def console(args):
+    path=require_server(args.instance)
+    password=rcon_secret(path)
+    try:
+        sock=socket.create_connection(('127.0.0.1',rcon_port(args.instance)),timeout=5)
+    except OSError as exc:
+        fail(f'Cannot connect to server {args.instance} console: {exc}\n'
+             f'Is it running? Restart it once after upgrading factorioctl to enable RCON.')
+    with sock:
+        sock.settimeout(5)
+        rcon_packet(sock,1,3,password)
+        while True:
+            request_id,packet_type,_=rcon_receive(sock)
+            if request_id==-1:fail('RCON authentication failed; restart the server to check credentials')
+            if request_id==1 and packet_type==2:break
+        def execute(command):
+            rcon_packet(sock,2,2,command)
+            response=[]
+            while True:
+                request_id,_,message=rcon_receive(sock)
+                if request_id==-1:fail('RCON command rejected')
+                if request_id==2:
+                    response.append(message)
+                    break
+            # Drain additional response packets without blocking the prompt.
+            sock.settimeout(0.15)
+            try:
+                while True:
+                    request_id,_,message=rcon_receive(sock)
+                    if request_id==2:response.append(message)
+            except (socket.timeout,ConnectionError,RuntimeError):
+                pass
+            finally:
+                sock.settimeout(5)
+            output=''.join(response).strip()
+            if output:print(output)
+        if args.command_text:
+            execute(' '.join(args.command_text))
+            return
+        print(f'Factorio server {args.instance} console (RCON on localhost). Type exit or quit to leave.')
+        while True:
+            try:command=input(f'factorio[{args.instance}]> ').strip()
+            except (EOFError,KeyboardInterrupt):
+                print()
+                return
+            if command.lower() in ('exit','quit'):return
+            if command:execute(command)
+
+GOOD_CONFIG_PATH = ('config-path=__PATH__executable__/../../config\n'
+                    'use-system-read-write-data-directories=false\n')
+GOOD_CONFIG_INI = ('[path]\n'
+                   'read-data=__PATH__executable__/../../data\n'
+                   'write-data=__PATH__executable__/../..\n')
+
+def run_server(number):
+    global STARTUP_MAINTENANCE_ACTIVE
+    path=require_server(number)
+    protect_mod_list(path)
+    if AUTO_UPDATE_ON_START:
+        print('Automatic startup maintenance enabled.', flush=True)
+        STARTUP_MAINTENANCE_ACTIVE = True
+        try:
+            with update_lock(path):
+                if AUTO_UPDATE_GAME: update_game(path, AUTO_UPDATE_BRANCH)
+                if AUTO_UPDATE_MODS: mods_update(path)
+        except Exception as exc:
+            if not START_IF_UPDATE_FAILS:
+                fail(f'Startup update failed; refusing to run: {exc}')
+            print(f'WARNING: startup update failed; continuing with existing files: {exc}', flush=True)
+        finally:
+            STARTUP_MAINTENANCE_ACTIVE = False
+    # An updater or external tool must not silently replace an enabled mod list.
+    protect_mod_list(path)
+    os.chdir(path)
+    password=rcon_secret(path,create=True)
+    port=rcon_port(number)
+    os.execv(str(binary(path)),[str(binary(path)), '--port',str(service_port(number)),
+      '--mod-directory',str(path/'mods'), '--server-settings',str(path/'data/server-settings.json'),
+      '--rcon-bind',f'127.0.0.1:{port}', '--rcon-password',password,
+      '--start-server-load-latest'])
+
+def schedule(args):
+    require_server(args.instance)
+    number=args.instance
+    name=f'factorio-restart@{number}.timer'
+    if args.action=='daily':
+        if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',args.time):fail('Time must be HH:MM (24-hour)')
+        folder=Path.home()/'.config/systemd/user'/f'{name}.d'
+        folder.mkdir(parents=True,exist_ok=True)
+        (folder/'schedule.conf').write_text('[Timer]\nOnCalendar=\nOnCalendar=*-*-* '+args.time+':00\n')
+        systemd('daemon-reload')
+        systemd('enable','--now',name)
+        systemd('restart',name)
+    elif args.action=='disable':systemd('disable','--now',name)
+    else:systemd('status',name)
+
+def bootstrap(args):
+    path=instance(args.instance)
+    if path.exists():fail(f'{path} already exists; bootstrap refuses to overwrite')
+    try:
+        install_binary(path,args.branch)
+        for sub in ('mods','saves','config'):(path/sub).mkdir(exist_ok=True)
+        settings=path/'data/server-settings.json'
+        if not settings.exists():
+            shutil.copy2(path/'data/server-settings.example.json',settings)
+        modlist=path/'mods/mod-list.json'
+        if not modlist.exists():write_json(modlist,{'mods':[{'name':'base','enabled':True}]})
+        # config-path.cfg is NOT an INI file. Factorio uses it to locate config.ini.
+        # Supply both explicitly to keep each server instance self-contained.
+        (path/'config-path.cfg').write_text(GOOD_CONFIG_PATH)
+        ini=path/'config/config.ini'
+        if not ini.exists():ini.write_text(GOOD_CONFIG_INI)
+    except Exception:
+        # Only remove the instance directory created by this bootstrap.
+        # Existing directories are rejected before installation begins.
+        if path.exists():
+            shutil.rmtree(path)
+            print(f"Removed incomplete bootstrap: {path}", file=sys.stderr)
+        raise
+    systemd('enable',f'factorio@{args.instance}.service')
+    # Enable the timer without starting Factorio itself. The restart helper
+    # only acts if the main service is already active.
+    systemd('enable','--now',f'factorio-restart@{args.instance}.timer')
+    print('\nInstallation ready. Service and daily restart timer enabled; game not started. No save created.\n')
+    labels=[('UDP game port:',str(service_port(args.instance))),
+            ('Copy your save to:',str(path/'saves')),
+            ('Copy mod-list.json to:',str(modlist)),
+            ('Copy mod ZIPs to:',str(path/'mods')),
+            ('Edit server settings:',str(settings))]
+    width=max(len(label) for label,_ in labels)
+    for label,value in labels[:4]:
+        print(f'{label:<{width}}  {value}')
+    print(f'    Or download enabled mods: factorioctl mods update {args.instance}')
+    label,value=labels[4]
+    print(f'{label:<{width}}  {value}')
+    print(f'Daily restart:          {DEFAULT_RESTART_TIME} (server local time; only while running)')
+    print(f'Then: factorioctl doctor {args.instance} && factorioctl start {args.instance}')
+
+def version(path):
+    p=subprocess.run([str(binary(path)),'--version'],capture_output=True,text=True,check=True)
+    m=re.search(r'Version: (\d+\.\d+\.\d+)',p.stdout)
+    if not m: fail('Cannot parse Factorio version: '+p.stdout)
+    return m.group(1)
+
+def credentials(path):
+    for name in ('player-data.json','data/server-settings.json'):
+        f=path/name
+        if not f.exists():continue
+        j=load_json(f)
+        user=j.get('service-username') or j.get('username')
+        token=j.get('service-token') or j.get('token')
+        if user and token:return user,token
+    return None,None
+
+def built_in_mods(path):
+    """Bundled game/expansion mods are directories under data, not portal ZIPs."""
+    result = {'core', 'base'}
+    data = path/'data'
+    if data.is_dir():
+        for child in data.iterdir():
+            if child.is_dir() and (child/'info.json').is_file():
+                info=load_json(child/'info.json')
+                result.add(info.get('name',child.name))
+    return result
+
+def enabled_third_party_mods(path):
+    listing=path/'mods/mod-list.json'
+    document=load_json(listing)
+    entries=document.get('mods', [])
+    if not isinstance(entries, list):
+        fail(f'Invalid mod list in {listing}: mods must be a list')
+    names=[]
+    builtin=built_in_mods(path)
+    for entry in entries:
+        if not isinstance(entry,dict) or not isinstance(entry.get('name'),str):
+            fail(f'Invalid mod entry in {listing}')
+        if entry.get('enabled') and entry['name'] not in builtin:
+            names.append(entry['name'])
+    return sorted(set(names))
+
+def protect_mod_list(path):
+    """Prevent accidental vanilla startup when a user's mod list was discarded."""
+    enabled=enabled_third_party_mods(path)
+    if not enabled and not ALLOW_VANILLA_MOD_LIST:
+        fail('No enabled third-party mods appear in '+str(path/'mods/mod-list.json')+
+             '. Factorio may have rewritten your list during its earlier startup '+
+             'without mod ZIPs. Restore mod-list.json from your PC, then run '+
+             '`factorioctl mods update N`. If this is intentionally vanilla, '+
+             'set ALLOW_VANILLA_MOD_LIST = True at the top of factorioctl.')
+    return enabled
+
+def local_mod_files(directory, name):
+    """Find installed versions (not zip filename-substring approximations)."""
+    result=[]
+    for file in directory.glob(name+'_*.zip'):
+        match=re.fullmatch(re.escape(name)+r'_(\d+\.\d+\.\d+)\.zip',file.name)
+        if match and zipfile.is_zipfile(file):
+            result.append((tuple(map(int,match.group(1).split('.'))),file))
+    unpacked=directory/name
+    if unpacked.is_dir() and (unpacked/'info.json').is_file():
+        info=load_json(unpacked/'info.json')
+        ver=info.get('version','0.0.0')
+        if re.fullmatch(r'\d+\.\d+\.\d+',ver):
+            result.append((tuple(map(int,ver.split('.'))),unpacked))
+    return sorted(result,reverse=True)
+
+
+def mod_info_from_file(source):
+    if source.is_dir():return load_json(source/'info.json')
+    with zipfile.ZipFile(source) as z:
+        names=[name for name in z.namelist() if name.endswith('/info.json') or name=='info.json']
+        if not names:fail(f'Mod ZIP has no info.json: {source}')
+        # Factorio mod ZIPs conventionally wrap files in one root directory.
+        names.sort(key=lambda n:(n.count('/'),len(n)))
+        return json.loads(z.read(names[0]))
+
+
+def mod_index():
+    """One portal index, cached across server instances and restarts."""
+    import time
+    cache=ROOT/'.cache/factorioctl/mod-index.json'
+    if cache.is_file() and time.time()-cache.stat().st_mtime<MOD_INDEX_TTL_SECONDS:
+        try:
+            entries=load_json(cache)['results']
+            print(f'Using cached portal index ({len(entries)} mods)',flush=True)
+            return {m['name']:m for m in entries}
+        except (OSError,ValueError,KeyError,TypeError):pass
+    print('Fetching Factorio mod portal master index (single request)...',flush=True)
+    data=json.loads(get('https://mods.factorio.com/api/mods',{'page_size':'max','hide_deprecated':'false'}))
+    entries=data.get('results',[])
+    if not entries:fail('Portal master index was empty or malformed')
+    cache.parent.mkdir(parents=True,exist_ok=True)
+    write_json(cache,data)
+    print(f'Indexed {len(entries)} portal mods; cache valid for {MOD_INDEX_TTL_SECONDS//60} minutes',flush=True)
+    return {m['name']:m for m in entries}
+
+
+def previous_releases(names):
+    """Bulk history lookup for mods whose newest release isn't for this Factorio version."""
+    if not names:return {}
+    print(f'Checking older compatible releases for {len(names)} mods...',flush=True)
+    # The portal supports repeated namelist query parameters; split conservatively.
+    result={}
+    for offset in range(0,len(names),60):
+        batch=names[offset:offset+60]
+        qs=urllib.parse.urlencode({'namelist':batch,'page_size':'max','hide_deprecated':'false'},doseq=True)
+        response=json.loads(get('https://mods.factorio.com/api/mods?'+qs))
+        for item in response.get('results',[]):result[item['name']]=item.get('releases',[])
+    return result
+
+
+def mods_update(path):
+    listing=path/'mods/mod-list.json'
+    if not listing.exists():fail('Missing '+str(listing))
+    bundled=built_in_mods(path)
+    enabled=set(protect_mod_list(path))
+    print('Bundled mods (not downloaded):', ', '.join(sorted(bundled)),flush=True)
+    directory=path/'mods'
+    major_minor='.'.join(version(path).split('.')[:2])
+    index=mod_index()
+    user,token=credentials(path)
+    # Most mods in the master index provide their newest release. Only ask
+    # for full release histories when that newest release does not match.
+    history={}
+    unresolved={name for name in enabled if name in index and
+        index[name].get('latest_release',{}).get('info_json',{}).get('factorio_version')!=major_minor}
+    if unresolved:history.update(previous_releases(sorted(unresolved)))
+    resolved={}; installed={}; deps_to_add=set(); queue=list(sorted(enabled)); downloaded=0
+    # Stage on the destination filesystem: os.replace() cannot cross mount points.
+    with tempfile.TemporaryDirectory(prefix='.factorio-mods-', dir=directory) as tmp:
+        staging=Path(tmp)
+        while queue:
+            name=queue.pop(0)
+            if name in resolved or name in installed or name in bundled:continue
+            current=local_mod_files(directory,name)
+            best_local=current[0] if current else None
+            record=index.get(name)
+            candidates=[]
+            if record:
+                latest=record.get('latest_release')
+                if latest and latest.get('info_json',{}).get('factorio_version')==major_minor:
+                    candidates=[latest]
+                else:
+                    if name not in history:
+                        history.update(previous_releases([name]))
+                    candidates=[r for r in history.get(name,[])
+                                if r.get('info_json',{}).get('factorio_version')==major_minor]
+            portal=max(candidates,key=lambda r:tuple(map(int,r['version'].split('.')))) if candidates else None
+            portal_version=tuple(map(int,portal['version'].split('.'))) if portal else None
+            # Custom local versions take precedence over stale/equal portal releases.
+            # The same-version case also preserves user-patched ZIPs.
+            if best_local and (not portal or best_local[0]>=portal_version):
+                source=best_local[1]
+                print(f'Keeping local {name} {".".join(map(str,best_local[0]))} ({source.name})',flush=True)
+                installed[name]=source
+            elif portal:
+                dest=directory/portal['file_name']
+                if dest.is_file() and hashlib.sha1(dest.read_bytes()).hexdigest()==portal['sha1']:
+                    source=dest
+                    print('OK',dest.name,flush=True)
+                else:
+                    if not (user and token):
+                        fail(f'Missing mod {name}; configure service-username/service-token to download it')
+                    source=staging/portal['file_name']
+                    url='https://mods.factorio.com'+portal['download_url']
+                    qs=urllib.parse.urlencode({'username':user,'token':token})
+                    print(f'Downloading {name} {portal["version"]}...',flush=True)
+                    download(url+('\u0026' if '?' in url else '?')+qs,source)
+                    if hashlib.sha1(source.read_bytes()).hexdigest()!=portal['sha1'] or not zipfile.is_zipfile(source):
+                        fail(f'Integrity check failed for {name}; nothing installed')
+                    # Persist verified downloads immediately. A missing custom mod later
+                    # must not discard everything successfully downloaded before it.
+                    os.replace(source,dest)
+                    source=dest
+                    downloaded+=1
+                    print(f'Installed {dest.name}',flush=True)
+                installed[name]=source
+            else:
+                fail(f'No {major_minor}-compatible portal release or local ZIP for {name}. '
+                     f'Copy a compatible ZIP into {directory} and retry.')
+            info=mod_info_from_file(installed[name])
+            if info.get('name')!=name:
+                fail(f'Mod ZIP {installed[name]} identifies itself as {info.get("name")!r}, expected {name!r}')
+            if info.get('factorio_version',major_minor)!=major_minor:
+                fail(f'Mod {name} ({installed[name]}) targets Factorio {info.get("factorio_version")}, not {major_minor}')
+            for dep in info.get('dependencies',['base']):
+                dep=dep.strip()
+                if dep.startswith(('?', '(?)', '!', '~', '+')):continue
+                # Factorio accepts major.minor as well as major.minor.patch
+                # in dependency constraints (e.g. 'base >= 2.1').
+                # Validate the entire string instead of accepting a partial match.
+                match=re.fullmatch(r'([\w-]+)(?:\s*(?:>=|<=|=|>|<)\s*\d+(?:\.\d+){1,2})?',dep)
+                if not match:fail(f'Unrecognized mandatory dependency {dep!r} for {name}')
+                child=match.group(1)
+                if child not in bundled and child not in enabled and child not in deps_to_add:
+                    print(f'Adding required dependency {child} (from {name})',flush=True)
+                    deps_to_add.add(child)
+                if child not in bundled and child not in installed and child not in queue:
+                    queue.append(child)
+            resolved[name]=True
+        # Downloads are persisted individually after SHA-1 and ZIP verification.
+        original=load_json(listing)
+        original_names={m['name'] for m in original['mods']}
+        additions=sorted(deps_to_add-original_names)
+        if additions:
+            backup=listing.with_name('mod-list.'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'.json')
+            shutil.copy2(listing,backup)
+            original['mods'].extend({'name':n,'enabled':True} for n in additions)
+            write_json(listing,original)
+    print(f'Mods ready: {len(resolved)} third-party mods; downloaded {downloaded}; retained local mods and old ZIPs.')
+    print('Factorio will validate dependency version constraints and incompatibilities on startup.')
+
+def change_mods(args):
+    """Enable/install or disable multiple mods without losing local ZIPs."""
+    path=require_server(args.instance)
+    check_not_active(args.instance)
+    listing=path/'mods/mod-list.json'
+    if not listing.is_file():fail(f'Missing {listing}')
+    bundled=built_in_mods(path)
+    names=list(dict.fromkeys(args.names))
+    if any(not name or name.strip()!=name for name in names):
+        fail('Mod names must be nonempty and must not have leading/trailing whitespace')
+    if any(name in bundled for name in names):
+        fail('Bundled mods are managed by Factorio, not enmod/dismod: '+
+             ', '.join(name for name in names if name in bundled))
+    with update_lock(path):
+        document=load_json(listing)
+        entries=document.get('mods')
+        if not isinstance(entries,list):fail('Invalid mod-list.json: mods must be a list')
+        by_name={}
+        for entry in entries:
+            if not isinstance(entry,dict) or not isinstance(entry.get('name'),str):
+                fail('Invalid mod-list.json entry')
+            if entry['name'] in by_name:fail(f'Duplicate mod entry: {entry["name"]}')
+            by_name[entry['name']]=entry
+        if args.command=='dismod':
+            missing=[name for name in names if name not in by_name]
+            if missing:fail('Not in mod-list.json: '+', '.join(missing))
+        original=listing.read_bytes()
+        changed=[]
+        for name in names:
+            entry=by_name.get(name)
+            if entry is None:
+                entry={'name':name,'enabled':True}
+                entries.append(entry)
+                by_name[name]=entry
+                changed.append(name)
+            else:
+                value=args.command=='enmod'
+                if entry.get('enabled')!=value:
+                    entry['enabled']=value
+                    changed.append(name)
+        if not changed:
+            print('No changes needed; all requested mods already '+
+                  ('enabled.' if args.command=='enmod' else 'disabled.'))
+            if args.command=='enmod':
+                # A mod may already be listed as enabled but its ZIP missing.
+                mods_update(path)
+            return
+        backup=listing.with_name('mod-list.'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.json')
+        shutil.copy2(listing,backup)
+        write_json(listing,document)
+        if args.command=='enmod':
+            try:
+                mods_update(path)
+            except Exception:
+                # Roll back enabling if missing dependencies/portal issues prevented a
+                # complete download. Already verified ZIPs are kept for a later retry.
+                temp=listing.with_name('mod-list.restore.tmp')
+                temp.write_bytes(original)
+                os.replace(temp,listing)
+                print('Mod list restored after failed download; verified ZIPs retained.',file=sys.stderr)
+                raise
+        print(('Enabled and installed: ' if args.command=='enmod' else 'Disabled: ')+', '.join(changed))
+        print('Changes take effect on the next server start; ZIP files were not deleted.')
+
+
+def latest_release(branch):
+    info=json.loads(get('https://factorio.com/api/latest-releases'))
+    releases=info.get(branch)
+    if isinstance(releases,dict) and releases.get('headless'):return releases['headless']
+    fail(f'Cannot find {branch} headless version in latest-releases response')
+
+def update_game(path, branch):
+    current=version(path)
+    newest=latest_release(branch)
+    print(f'Factorio {branch}: installed {current}, latest {newest}', flush=True)
+    if current==newest:
+        print('Factorio binary is up to date.')
+        return
+    with tempfile.TemporaryDirectory(prefix='.factorio-new-',dir=ROOT) as tmp:
+        tmp_path=Path(tmp)/'server'
+        install_binary(tmp_path,branch)
+        if version(tmp_path)!=newest:fail('Downloaded version does not match latest release')
+        olddata=path/'data'
+        oldsettings=olddata/'server-settings.json'
+        saved=oldsettings.read_bytes() if oldsettings.exists() else None
+        replacement=tmp_path/'data'
+        stamp=datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        previous=path/('data.previous.'+stamp)
+        if olddata.exists():olddata.rename(previous)
+        try:
+            shutil.move(str(replacement),str(olddata))
+            if saved is not None:oldsettings.write_bytes(saved)
+            # os.replace gives an atomic switch for the executable on this filesystem.
+            temporary_binary=binary(path).with_name('factorio.new')
+            shutil.copy2(binary(tmp_path),temporary_binary)
+            os.replace(temporary_binary,binary(path))
+        except Exception:
+            if previous.exists():
+                if olddata.exists():shutil.rmtree(olddata)
+                previous.rename(olddata)
+            raise
+
+class update_lock:
+    def __init__(self,path):self.path=path;self.fp=None
+    def __enter__(self):
+        import fcntl
+        self.fp=open(self.path/'.factorioctl-update.lock','a+')
+        fcntl.flock(self.fp,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return self
+    def __exit__(self,*args):
+        import fcntl
+        fcntl.flock(self.fp,fcntl.LOCK_UN)
+        self.fp.close()
+
+def update(args):
+    path=require_server(args.instance)
+    check_not_active(args.instance)
+    with update_lock(path):
+        if not args.mods_only:update_game(path,args.branch)
+        if not args.binary_only:mods_update(path)
+    print('Update finished; server remains stopped.')
+
+def check_not_active(number):
+    p=subprocess.run(['systemctl','--user','is-active','--quiet',f'factorio@{number}.service'])
+    if p.returncode==0:fail('Stop factorio@'+str(number)+' before changing binaries or mods')
+
+def timer_details(number):
+    """Read user timer state without failing when disabled or not yet triggered."""
+    name=f'factorio-restart@{number}.timer'
+    p=subprocess.run(['systemctl','--user','show',name,
+                      '--property=LoadState,UnitFileState,ActiveState,NextElapseUSecRealtime,LastTriggerUSec'],
+                     capture_output=True,text=True)
+    if p.returncode != 0:
+        return {'LoadState':'not-found','ActiveState':'unknown','UnitFileState':'unknown'}
+    return dict(line.split('=',1) for line in p.stdout.splitlines() if '=' in line)
+
+def show_timer_status(number):
+    details=timer_details(number)
+    print('Scheduled restart:')
+    print('  Timer:   ',f'factorio-restart@{number}.timer')
+    print('  State:   ',details.get('ActiveState','unknown'))
+    print('  Enabled: ',details.get('UnitFileState','unknown'))
+    for prop,label in (('LastTriggerUSec','Last run'),('NextElapseUSecRealtime','Next run')):
+        val=details.get(prop,'').strip()
+        if val and val not in ('n/a','0',''):print(f'  {label:<8} {val}')
+
+def doctor(args):
+    path=require_server(args.instance)
+    issues=[]
+    for p in (binary(path),path/'data/server-settings.json',path/'mods/mod-list.json',path/'config-path.cfg'):
+        print(('OK ' if p.exists() else 'MISSING ')+str(p))
+        if not p.exists():issues.append(str(p))
+    cfg=path/'config-path.cfg'
+    if cfg.exists() and 'config-path=' not in cfg.read_text():
+        issues.append(f'Invalid {cfg}: missing config-path=')
+    if binary(path).exists():print('Factorio version:',version(path))
+    saves=sorted((path/'saves').glob('*.zip')) if (path/'saves').is_dir() else []
+    print('Save ZIPs:',len(saves))
+    if not saves:issues.append('No save in '+str(path/'saves'))
+    for p in (path/'data/server-settings.json',path/'mods/mod-list.json'):
+        if p.exists():
+            try:load_json(p)
+            except Exception as e:issues.append(f'Invalid JSON {p}: {e}')
+    user,token=credentials(path)
+    print('Mod download credentials:', 'present' if user and token else 'absent (only required for downloads)')
+    modlist=path/'mods/mod-list.json'
+    if modlist.exists():
+        try:
+            third_party=enabled_third_party_mods(path)
+            if not third_party and not ALLOW_VANILLA_MOD_LIST:
+                issues.append('No enabled third-party mods: restore mod-list.json from your local machine (or explicitly allow vanilla with ALLOW_VANILLA_MOD_LIST = True)')
+            wanted={m['name'] for m in load_json(modlist)['mods'] if m.get('enabled')}
+            missing=[name for name in sorted(wanted-built_in_mods(path)) if not list((path/'mods').glob(name+'_*.zip')) and not (path/'mods'/name).is_dir()]
+            print('Missing enabled third-party mods:',len(missing))
+            if missing: issues.append('Missing mod files: '+', '.join(missing))
+        except (ValueError,KeyError,TypeError) as exc:issues.append('Could not inspect mod list: '+str(exc))
+    show_timer_status(args.instance)
+    details=timer_details(args.instance)
+    if AUTO_UPDATE_ON_START and (AUTO_UPDATE_GAME or AUTO_UPDATE_MODS) and details.get('ActiveState') != 'active':
+        print('WARNING: Startup auto-updates are enabled, but the daily restart timer is not active.')
+        print(f'         Enable with: factorioctl schedule {args.instance} daily {DEFAULT_RESTART_TIME}')
+    if issues:
+        for issue in issues:print('ISSUE:',issue)
+        fail(f'{len(issues)} issue(s) found')
+    print('Ready for a first start (game-level mod compatibility is verified at runtime).')
+
+def main():
+    p=argparse.ArgumentParser(
+        prog='factorioctl',
+        description='Manage Factorio headless server instances with one command.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  factorioctl bootstrap 1               Set up instance 1 (no save created)
+  factorioctl doctor 1                  Check save, config, and binary
+  factorioctl start 1                   Start the server
+  factorioctl logs 1                    Follow its journal
+  factorioctl console 1                 Interactive game console (RCON)
+  factorioctl console 1 /promote Name    Promote a player to admin
+  factorioctl stop 1                    Stop before updating
+  factorioctl update 1                  Update game and enabled mods
+  factorioctl mods update 1             Update enabled mods only
+  factorioctl enmod 1 ModA ModB        Enable/download one or more mods
+  factorioctl dismod 1 ModA ModB       Disable mods, keep installed ZIPs
+  factorioctl schedule 1 daily 02:00    Change daily restart time (bootstrap enables 02:00)
+  factorioctl schedule 1 disable        Disable the restart timer
+  factorioctl units sync                Install embedded systemd units
+
+Bootstrap assigns UDP 34197 to instance 1, 34198 to instance 2, etc.
+Systemd unit templates are embedded in factorioctl and synchronized with
+your user systemd directory (with consent) on management commands.
+Use COMMAND --help for command-specific options.""")
+    p.add_argument('--yes',action='store_true',help='Approve installation/replacement of embedded systemd units without prompting')
+    sub=p.add_subparsers(dest='command',required=True,metavar='COMMAND')
+    b=sub.add_parser('bootstrap',help='Create server-N, enable service and daily restart timer (no save created)',description='Download a clean Factorio headless server, create configs, and enable systemd service and daily 02:00 restart timer without starting the game.')
+    b.add_argument('instance',type=int,help='Server number (e.g. 1 for server-1, UDP 34197)')
+    b.add_argument('--branch',choices=['stable','experimental'],default='stable',help='Game release channel (default: stable)')
+    b.add_argument('--yes',action='store_true',help='Approve systemd unit changes without prompting')
+    u=sub.add_parser('update',help='Update game and mods on a stopped server',description='Update a stopped Factorio instance. By default updates game binaries and enabled mods.')
+    u.add_argument('instance',type=int,help='Server number')
+    u.add_argument('--branch',choices=['stable','experimental'],default='stable',help='Game release channel (default: stable)')
+    g=u.add_mutually_exclusive_group()
+    g.add_argument('--mods-only',action='store_true',help='Update mods without downloading game binaries')
+    g.add_argument('--binary-only',action='store_true',help='Update game binaries without touching mods')
+    m=sub.add_parser('mods',help='Manage installed mods',description='Manage Factorio mods; run mods update N to fetch enabled compatible releases.')
+    m.add_argument('action',choices=['update'],help='Update enabled mods')
+    m.add_argument('instance',type=int,help='Server number')
+    for name, explanation in (
+        ('enmod','Enable one or more mods; download missing mods and required dependencies'),
+        ('dismod','Disable one or more existing mods; preserve installed ZIPs')):
+        cmd=sub.add_parser(name,help=explanation,description=explanation+
+                           '. Server must be stopped. Changes take effect on next start.')
+        cmd.add_argument('instance',type=int,help='Server number (e.g. 1)')
+        cmd.add_argument('names',nargs='+',metavar='MOD_NAME',help='Exact Factorio mod name(s), case-sensitive')
+    un=sub.add_parser('units',help='Manage user-level systemd template files',description='Check/install embedded systemd unit templates, prompting before changes.')
+    un.add_argument('action',choices=['sync'],help='Check/install embedded unit templates')
+    un.add_argument('--yes',action='store_true',help='Approve systemd unit changes without prompting')
+    sc=sub.add_parser('schedule',help='Configure scheduled instance restarts',description='Configure, disable, or inspect the daily systemd restart timer for an instance.')
+    sc.add_argument('instance',type=int,help='Server number')
+    sc.add_argument('action',choices=['daily','disable','status'],help='daily=enable at HH:MM; disable=stop timer; status=show timer')
+    sc.add_argument('time',nargs='?',help='Local server time HH:MM when using daily')
+    sc.add_argument('--yes',action='store_true',help='Approve systemd unit changes without prompting')
+    rs=sub.add_parser('run-server',help='Internal systemd launch entry point (do not invoke manually)',description='Internal entry point used by systemd; not for interactive use')
+    rs.add_argument('instance',type=int)
+    co=sub.add_parser('console',help='Connect to a running server console over local RCON',description='Interactive RCON console. Use /promote PlayerName to grant admin privileges; exit or quit to leave. Can also supply a one-shot command.')
+    co.add_argument('instance',type=int,help='Server number')
+    co.add_argument('command_text',nargs='*',metavar='COMMAND',help='Optional command to run once (e.g. /promote PlayerName)')
+    descriptions={'start':'Start a configured server', 'stop':'Stop a running server gracefully',
+                  'restart':'Restart the server (performs configured automatic updates)', 'status':'Show systemd service status',
+                  'logs':'Follow the server journal', 'doctor':'Check required files and configuration'}
+    for command,helptext in descriptions.items():
+        cmd=sub.add_parser(command,help=helptext,description=helptext)
+        cmd.add_argument('instance',type=int,help='Server number')
+    args=p.parse_args()
+    if hasattr(args, 'instance') and args.command not in ('bootstrap',):
+        require_server(args.instance)
+    # Do not do interactive unit management during systemd's internal ExecStart.
+    # Help is handled by argparse before reaching this point.
+    if args.command!='run-server':
+        sync_units(args.yes)
+    if args.command=='bootstrap':bootstrap(args)
+    elif args.command=='update':update(args)
+    elif args.command=='mods':
+        check_not_active(args.instance)
+        with update_lock(instance(args.instance)):mods_update(instance(args.instance))
+    elif args.command in ('enmod','dismod'):change_mods(args)
+    elif args.command=='doctor':doctor(args)
+    elif args.command=='units':print('Systemd units are up to date.')
+    elif args.command=='schedule':schedule(args)
+    elif args.command=='run-server':run_server(args.instance)
+    elif args.command=='console':console(args)
+    elif args.command=='logs':run(['journalctl','--user','-u',f'factorio@{args.instance}.service','-f'])
+    elif args.command=='status':
+        result=subprocess.run(['systemctl','--user','status',f'factorio@{args.instance}.service'])
+        show_timer_status(args.instance)
+        if result.returncode not in (0,3):
+            fail(f'systemctl status returned {result.returncode}')
+    else:systemd(args.command,f'factorio@{args.instance}.service')
+
+if __name__=='__main__':
+    try:main()
+    except KeyboardInterrupt:
+        if STARTUP_MAINTENANCE_ACTIVE:
+            # systemd stopped/restarted the service while the pre-launch updater
+            # was waiting on a network request. No Factorio process has started.
+            print('Startup maintenance interrupted by service stop; exiting cleanly.', flush=True)
+            sys.exit(0)
+        print('Interrupted.', file=sys.stderr)
+        sys.exit(130)
+    except (OSError,ValueError,RuntimeError,urllib.error.URLError,subprocess.CalledProcessError) as exc:
+        print('ERROR:',exc,file=sys.stderr)
+        sys.exit(1)
